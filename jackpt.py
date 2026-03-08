@@ -146,6 +146,12 @@ class Value():
         #   Substitute back a = e^c: dc/da = 1/a
         return Value(data=math.log(self.data), children=(self,), local_grads={self: 1.0 / self.data})
 
+    def exp(self) -> 'Value':
+        # c = e^a
+        # ∂c/∂a = e^a  (e^x is the unique function that is its own derivative)
+        result = math.exp(self.data)
+        return Value(data=result, children=(self,), local_grads={self: result})
+
     def neg(self) -> 'Value':
         return self * -1
 
@@ -751,6 +757,35 @@ def gpt(token_idx: int, pos_idx: int, keys: KVCache, values: KVCache) -> Vector:
        # 1) Attention block
        # =======
        #
+       # What is the purpose of residual?
+       # ======
+       #
+       # This is used as `output = f(x) + x` where X is the residual
+       #
+       # We save this at the top of the attention block because X will get
+       # modified later on but we want the original. The idea is that attention
+       # only needs to compute a *correction* — what new information should be
+       # added — rather than recomputing the entire representation from scratch.
+       # The original `x_in` carries through unchanged and the attention output
+       # is folded in on top of it - And we don't want to throw it out.
+       #
+       # Math explanation: The chain rule would otherwise cause the gradients to
+       # shrink towards zero as things go through each layer so we need some
+       # other way to preserve the healthy gradients.
+       # For most operations in a neural network, that number is less than
+       # 0.9 × 0.9 × 0.9 × 0.9 × 0.9 × 0.9 × 0.9 × 0.9 × 0.9 × 0.9
+       # = 0.9^10
+       # = 0.35   ← gradient at layer 10 is already less than half
+       # = 0.9^50
+       # = 0.005  ← gradient at layer 50 is nearly zero
+       #
+       # The residual connection sidesteps this because addition has a local gradient of exactly 1 — it passes gradients through unchanged.
+       #
+       # ∂output/∂x = ∂f(x)/∂x + 1
+       # That `+ 1` is the key — even if `∂f(x)/∂x` shrinks toward zero through
+       # many layers, there's always that constant 1 being added, so the
+       # gradient can never fully vanish. It's a guaranteed highway for
+       # gradients straight back to the input regardless of what `f` does.
         x_residual: Vector = x_in
         x_in = rmsnorm(x_in)
         # x_in` is a general-purpose 16D vector — it encodes "what token I am and where I am", but it's not specialised for any particular role. Before the token can participate in attention, it needs to be projected into three specialised roles:
@@ -853,15 +888,46 @@ def gpt(token_idx: int, pos_idx: int, keys: KVCache, values: KVCache) -> Vector:
         #
         # Aside: In general weights matrices are what are built up during the training stage.
         x_in = linear(attn_output, state_dict[f'layer{layer_idx}.attn_wo'])
+        # This step ensures that the residual freeway is in place in the mathematics.
         x_in = [attn_out + residual for attn_out, residual in zip(x_in, x_residual)]
 
         # 2) MLP block
         # =====
+        #
+        # Another residual?
+        # ======
+        # This is a separate one to win the attention block. By the time we get to this line, Xin already has the attention block's output folded into it. It just saves that new one as a baseline.
         x_residual = x_in                                                              # Vector length n_embed (16) — saved for residual addition
+        # This is needed to control the scale before the next round of computation, especially since we added a residual.
         x_in = rmsnorm(x_in)
+        # This is the expand phase of MLP - we scale from 16D to 64D to give more working space.
+        #
+        # This is especially important due to ReLU on the next line. With only
+        # 16 dimensions in and 16 out, a single matrix multiply is a linear
+        # transformation — it can rotate and scale the vector but can't learn
+        # anything that a simpler model couldn't. The non-linearity (relu on the
+        # next line) is what actually buys expressiveness, but relu needs room
+        # to work — it zeros out negative values, and if you only have 16 values
+        # to work with, zeroing some out leaves very little signal.
+        #
+        # Think of it like doing mental arithmetic — it's easier to solve a hard
+        # problem if you're allowed to write out intermediate steps on a big
+        # sheet of paper rather than keeping everything in your head. T
         x_in = linear(x_in, state_dict[f'layer{layer_idx}.mlp_fc1'])                  # Vector length 4*n_embed (64) — expand
+        # without it, stacking linear transformations (matrix multiplies) on top
+        # of each other is mathematically equivalent to just one matrix
+        # multiply. No matter how many `linear()` calls you chain together, you
+        # could always collapse them into a single matrix. The network would
+        # have no more expressive power than a single layer. . This is what lets
+        # the MLP learn genuinely non-linear functions.
+        #
+        # After relu, the 64D vector contains a sparse pattern of activations —
+        # some neurons fired, most are zero. `
         x_in = [element.relu() for element in x_in]                                   # Vector length 4*n_embed (64) — non-linearity
         x_in = linear(x_in, state_dict[f'layer{layer_idx}.mlp_fc2'])                  # Vector length n_embed (16)   — compress back
+        # This is the second half of the expand-then-compress pattern — the mirror image of `fc1`. It takes the 64D vector back down to 16D using a `[16×64]` weight matrix.
+        #
+        # fc2` is not just throwing away 48 dimensions — it's learned to read the *pattern* of which neurons fired as a code. For example it might have learned "if neurons 3, 17, and 42 all fired together, that means this is a name-ending pattern, so push dimension 7 of x_in in this direction." The specific combination matters, not just the individual neurons.
         x_in = [mlp_out + residual for mlp_out, residual in zip(x_in, x_residual)]    # Vector length n_embed (16) — residual connection
         return x_in
 
@@ -889,3 +955,269 @@ def gpt(token_idx: int, pos_idx: int, keys: KVCache, values: KVCache) -> Vector:
     #  dot product is high when two vectors point in similar directions. So if `x` is saying "this looks like a name about to end in a vowel", the rows for `'a'`, `'e'`, `'i'` will have high dot products with it, producing high logits for those tokens.
     logits: Vector = linear(x, state_dict['lm_head'])           # Vector length vocab_size (27)
     return logits
+
+first_moment  = [0.0] * len(params) # exponential moving average of gradients
+second_moment = [0.0] * len(params) # exponential moving average of squared gradients
+
+num_steps = 1000 # number of training steps
+for step in range(num_steps):
+    # (Yes this doesn't actually look at the whole corpus. With num_steps equal
+    # to 1,000 it's only going through about 3% of the total of 32,000 names.
+    # The standard approach, not depicted here, is to cycle through the data
+    # multiple times using epochs as an outer loop and shuffling the docs each time  )
+    doc = docs[step % len(docs)]
+
+    # Take single document (a name here), tokenize it, surround it with BOS special token on both sides
+    tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
+    # Why min?
+    # ===
+    # A **defensive guard** against edge cases in the data. `names.txt` could theoretically contain an unusually long entry — a hyphenated name, a data corruption, a stray sentence — that exceeds 16 characters. Without the `min`, `pos_id` would march past 16 and the KV cache would grow beyond what the model was designed for, likely producing nonsense or crashing.
+    num_predictions_needed = min(block_size, len(tokens) - 1)
+
+    # This is a deliberate reset between documents because each document is an
+    # independent training example. Instead the KV cache accumulates context as
+    # the model processes tokens within a document. But it must not bleed into
+    # the next document. I.e. Emma attending to tokens from Olivia will be
+    # nonsensical since they have no relationship.
+    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+    losses = []
+    for position_idx in range(num_predictions_needed):
+        token_idx  = tokens[position_idx]
+        target_idx = tokens[position_idx + 1]
+        # How come GPT is used here in the training loop?
+        # ====
+        # It's the same function for both training and generation — the forward
+        # pass is identical in both cases. What changes is what you *do* with
+        # the logits afterwards:
+        # - Training: you compare the logits against the known correct next token (`target_idx`) to compute a loss, then run backprop to adjust the weights
+        # - Generation: sample from the logits to pick the next token, then feed that token back in as the next input
+        #
+        # What are logits in this context?
+        # ====
+        # Each of the 27 logits is the model's **raw, unnormalized confidence
+        # score** for "given everything I've seen so far in this name, how
+        # likely is each character to come next?"
+        logits: Vector = gpt(token_idx, position_idx, keys, values)
+        # Make sure the probability is summed to one.
+        probs: Vector = softmax(logits)
+        # Why -log(p)? The betting analogy.
+        # ===
+        # Think of the model as a gambler spreading £1 across 27 horses (characters). After the
+        # race, we only care about how much it bet on the winning horse — probs[target_idx].
+        #
+        # log() is a function that grows slowly: log(1) = 0, log(0.5) ≈ -0.69, log(0.01) ≈ -4.6.
+        # As p approaches 0 it shoots toward -infinity; as p approaches 1 it flattens toward 0.
+        # The negative sign flips it so that low confidence = high penalty:
+        #
+        #   bet £0.90 on winner → -log(0.90) ≈ 0.10  tiny penalty   (confident and right)
+        #   bet £0.10 on winner → -log(0.10) ≈ 2.30  bigger penalty  (uncertain)
+        #   bet £0.01 on winner → -log(0.01) ≈ 4.60  harsh penalty   (almost certain about the wrong horse)
+        #
+        # Crucially, we never look at the wrong horses at all. It doesn't matter how the
+        # remaining probability was spread — only the winner's share counts. This is called
+        # cross-entropy loss and is the standard loss function for classification problems.
+        #
+        loss_at_position: Value = -probs[target_idx].log()
+        losses.append(loss_at_position)
+
+    # losses` at this point is a list of `num_predictions_needed` individual
+    # loss values — one per character position in the name. For `"emma"` that
+    # might be something like `[3.2, 2.1, 0.8, 1.4, 2.0]` — the model was more
+    # or less wrong at each position
+    #
+    # We take the mean rather than the sum because names have different lenghts and otherwise a 10 char name would produce a bigger loss.
+    loss: Value = (1 / num_predictions_needed) * sum(losses) # final average loss over the document sequence. May yours be low.
+
+    # Up until this point, every operation in the forward pass — the matrix multiplies, the softmax, the log, the averaging — wasn't just computing numbers. Because this is a `Value`-based autograd engine (like Karpathy's micrograd), every operation also secretly recorded *how it was computed* and *what its inputs were*, building up a **computation graph** — a chain of operations from the raw weights all the way to the final `loss` scalar.
+
+    # `loss.backward()` walks that graph in reverse — from `loss` back through
+    # every operation to every parameter — and computes the **gradient** of each
+    # parameter: "if I nudge this weight slightly, how much does the loss go up
+    # or down?" That gradient gets stored in `p.grad` on each parameter.
+    #
+    # Where do these contagious Value objects enter?
+    # ===
+    # In the `matrix` function above (its weights are initialized with Value objects) then the `gpt` functino does math on them.
+    loss.backward()
+
+    # Adam optimizer
+    # ====
+    # This is used instead of gradient descent (p.data -= lr * p.grad)
+    #
+    # What is the learning rate?
+    # ===
+    # Controls how big a step we take when updating each weight. This line decays it linearly over time — at step 0 it's the full `learning_rate` (0.01), at the final step it's nearly 0.
+    #
+    # Why do we change it over time as training goes on?
+    # ====
+    # Early in training the model knows nothing so you want bold, aggressive updates. Later, as weights converge toward good values, you want small, careful nudges so you don't overshoot and undo what you've learned.
+    learning_rate       = 0.01  # base learning rate before decay
+    first_moment_decay  = 0.85  # how much to weight past gradients (vs new signal) in the running average
+    second_moment_decay = 0.99  # same but for squared gradients
+    epsilon             = 1e-8  # tiny number added to denominator to prevent division by zero
+    learning_rate_current_step = learning_rate * (1 - step / num_steps) # linear learning rate decay
+    # What is params here?
+    # ====
+    # It's a flat list of every value weight in the whole model. Enumerate gives
+    # us both its index and its weight. The reason we can index here is that we
+    # create a sort of super structure that takes into account all the attention
+    # weight matrices , etc. Just refer to the definition of it above.
+    #
+    for param_idx, param in enumerate(params):
+        # What's the overall idea in this optimizer?
+        # ====
+        # After `loss.backward()`, every parameter has a `param.grad` — a raw gradient saying "nudge me in this direction by this much." But raw gradients are noisy. One step the gradient might say "go left hard", the next step "go right a bit", the next "go left hard" again. If you follow each raw gradient blindly you zigzag and make slow progress.
+
+        # The first moment smooths that out by keeping a **memory of recent
+        # gradients**. It's like a rolling average that fades the past:
+        #
+        # Imagine gradients over 3 steps were: 0.8, 0.1, 0.9
+        # first_moment_decay = 0.85 means "weight the past at 85%, new signal at 15%"
+        #
+        # step 1: first_moment = 0.85 * 0.0   + 0.15 * 0.8  = 0.12   # mostly nothing yet
+        # step 2: first_moment = 0.85 * 0.12  + 0.15 * 0.1  = 0.117  # smoothed down
+        # step 3: first_moment = 0.85 * 0.117 + 0.15 * 0.9  = 0.234  # trending upward
+        #
+        # The 0.85 * first_moment[param_idx] part is "remember most of what I knew before".
+        # The (1 - 0.85) * param.grad part is "but let the new gradient nudge me slightly".
+        # Together they produce a smooth trend rather than a jittery signal.
+        #
+        # The big idea is that each parameter gets its own personalized learning rate.
+        #
+        # What is the difference between the first and second moment measure?
+        # ====
+        # The first moment tracks the **average direction** — is this parameter's gradient consistently pointing left, or right, or all over the place? It's a smoothed version of the gradient itself, so it retains sign (+/-).
+
+        # The second moment tracks the **average magnitude of movement** — has
+        # this parameter been getting large gradients or small ones? Squaring
+        # removes the sign, so it doesn't care about direction — only about how
+        # big the swings have been.
+
+        # Together they produce a signal like: "move in the direction the first
+        # moment points, but scale the step size down if the second moment says
+        # this parameter has been volatile.
+        #
+        # It comes from statistics (and is used in a somewhat analagous way here)
+        # - **1st moment** = the mean (average value) — where is the centre of mass?
+        # - **2nd moment** = the variance (average squared deviation) — how spread out is it?
+        first_moment[param_idx]  = first_moment_decay  * first_moment[param_idx]  + (1 - first_moment_decay)  * param.grad
+        second_moment[param_idx] = second_moment_decay * second_moment[param_idx] + (1 - second_moment_decay) * param.grad ** 2
+        # Why bias correction?
+        # ===
+        # Both moment buffers start at 0.0. At step 1, the running average is heavily dragged
+        # toward zero just because of that initialisation — not because the gradient is small.
+        # This is an initialisation artifact that would cause the model to take a tiny timid
+        # step when it should be taking a full one.
+        #
+        # Dividing by (1 - decay ** (step + 1)) undoes that drag:
+        #
+        #   step 1:  divide by (1 - 0.85^1)  = 0.15   → rescales strongly  (buffer is cold)
+        #   step 10: divide by (1 - 0.85^10) = 0.803  → rescales barely    (buffer is warming)
+        #   step 50: divide by (1 - 0.85^50) ≈ 1.0    → no effect at all   (buffer is fully warm)
+        #
+        # The correction is strong early and quietly fades away as the buffers fill with real data.
+        first_moment_bias_corrected  = first_moment[param_idx]  / (1 - first_moment_decay  ** (step + 1))
+        second_moment_bias_corrected = second_moment[param_idx] / (1 - second_moment_decay ** (step + 1))
+        # This is the acutal weight update.
+        #
+        # Why -= and not +=?
+        # ===
+        # The gradient points in the direction of steepest ascent. But we want to move against the gradient to reduce loss.
+        #
+        # Why multiply by first_moment_bias_corrected?
+        # ===
+        # The first moment tracks the **average direction** — is this parameter's gradient consistently pointing left, or right, or all over the place? It's a smoothed version of the gradient itself, so it retains sign (+/-) which travels via the multiplication
+        #
+        # Why divide by second_moment_bias_corrected ** 0.5 + epsilon?
+        # ===
+        # dividing by the square root of the second moment. This is each
+        # parameter's personal speed limiter. If a parameter has been getting
+        # wild noisy gradients, its second moment is large, so this division
+        # produces a small number — the update is reined in. If gradients have
+        # been small and stable, the division produces a larger number — the
+        # update gets a boost.
+        #
+        # Why * learning_rate_current_step?
+        # ===
+        # scales the whole thing down to a sensible magnitude. Without this,
+        # even a well-shaped update might be enormous and overshoot.
+        #
+        # Why + epilson?
+        # ===
+        # Just prevents division by zero if the second moment ever hits exactly
+        # 0.0.
+        param.data -= learning_rate_current_step * first_moment_bias_corrected / (second_moment_bias_corrected ** 0.5 + epsilon)
+        # Doesn't this lose info?
+        # ===
+        # Yes it does discard the gradient but deliberately. The information
+        # isn't lost because it has already been consumed by the data and also
+        # to update the first and second moments.
+        #
+        # If you didn't zero it out here, the next step's gradient would pile on
+        # top of the previous step's gradient and the update would be
+        # double-counted due to back propogation doing += on `grad`
+        param.grad = 0
+
+    print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}")
+
+# in (0, 1], control the "creativity" of generated text, low to high
+temperature = 0.5
+number_of_items_to_generate = 20
+print("\n--- inference (new, hallucinated names) ---")
+# This generates that number of samples.
+for sample_number in range(number_of_items_to_generate):
+    keys: KVCache = [[] for _ in range(n_layer)]
+    values: KVCache = [[] for _ in range(n_layer)]
+    # This is seeding the generation with the BOS token — the same "start of name" signal the model was trained on.
+
+    # During training, every name was wrapped with BOS on both sides: `[BOS, e,
+    # m, m, a, BOS]`. The model learned that BOS at the start means "a name is
+    # about to begin" and should be followed by a plausible first character. BOS
+    # at the end means "stop". So by setting `token_idx = BOS` here, we're
+    # telling the model "you're at the start of a new name — what character
+    # should come first?"
+    token_idx: int = BOS
+    # We build up the outputs in each name this way and accumulate them into a single string.
+    generated_chars: list[str] = []
+    # Why block_size here?
+    # ====
+    # It's a safety cap — the maximum number of tokens the model can generate
+    # before we force-stop it. In theory the model should stop itself by
+    # predicting BOS (the end-of-name signal), and for short names it always
+    # will. But `block_size` is there as a hard limit in case the model gets
+    # stuck in a loop and never predicts BOS — without it, generation could run
+    # forever.
+    for position_idx in range(block_size):
+        logits: Vector = gpt(token_idx, position_idx, keys, values)
+        # What does temperature do here?
+        # ====
+        # Changes the *shape* of the probability distribution that softmax produces.
+        #
+        # Imagine the model's logits for three characters are `[2.0, 1.5, 1.0]`:
+        #
+        # # temperature = 1.0 (no change)
+        # softmax([2.0, 1.5, 1.0]) → [0.51, 0.31, 0.18]  # spread out, uncertain
+
+        # # temperature = 0.5 (divide by 0.5 = multiply by 2)
+        # softmax([4.0, 3.0, 2.0]) → [0.71, 0.26, 0.10]  # more confident becaue the first one is more dominant
+
+        # # temperature = 0.1 (very small)
+        # softmax([20.0, 15.0, 10.0]) → [0.99, 0.007, 0.00003]  # almost deterministic because the first one is super dominant
+
+        probs: Vector = softmax([l / temperature for l in logits])
+        # This samples the next token from the probabily distribution
+        #
+        # Why range(vocab_size)?
+        # ===
+        # Because that is the set of encoded IDs within our vocabulary that we can choose from.
+        #
+        # Why `weights=[p.data for p in probs]`?
+        # ===
+        # Because `random.choices` expects a list of weights corresponding to each element in `range(vocab_size)`.
+        #
+        # Essentially this causes random.choices to pick an element in accordance with the weight and steer it in that direction.
+        token_idx = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
+        if token_idx == BOS:
+            break
+        generated_chars.append(uchars[token_idx])
+    print(f"sample {sample_number+1:2d}: {''.join(generated_chars)}")
