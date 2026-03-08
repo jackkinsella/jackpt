@@ -13,13 +13,15 @@ from persistence import model_filename, save_model, load_model
 # Command-line arguments
 # ======================
 parser = argparse.ArgumentParser(description='JackPT — a micro GPT implementation')
-parser.add_argument('--retrain',            action='store_true', default=False, help='Force retraining even if a saved model exists')
-parser.add_argument('--num_steps',          type=int,            default=1000,  help='Number of training steps (default: 1000)')
-parser.add_argument('--n_embed',            type=int,            default=16,    help='Embedding dimensionality (default: 16)')
-parser.add_argument('--anti-probable-mode', action='store_true', default=False, help='Invert the probability distribution to generate maximally unlikely output')
-parser.add_argument('--num-names',          type=int,            default=20,    help='Number of names to generate during inference (default: 20)')
-parser.add_argument('--learning-rate',      type=float,          default=0.01,  help='Adam optimizer learning rate (default: 0.01, try 0.005 for larger models)')
-parser.add_argument('--seed',               type=int,            default=None,  help='Random seed for reproducibility (omit for true randomness)')
+parser.add_argument('--retrain',            action='store_true', default=False,              help='Force retraining even if a saved model exists')
+parser.add_argument('--num_steps',          type=int,            default=1000,               help='Number of training steps (default: 1000)')
+parser.add_argument('--n_embed',            type=int,            default=16,                 help='Embedding dimensionality (default: 16)')
+parser.add_argument('--anti-probable-mode', action='store_true', default=False,              help='Invert the probability distribution to generate maximally unlikely output')
+parser.add_argument('--num-names',          type=int,            default=20,                 help='Number of names to generate during inference (default: 20)')
+parser.add_argument('--learning-rate',      type=float,          default=0.01,               help='Adam optimizer learning rate (default: 0.01, try 0.005 for larger models)')
+parser.add_argument('--temperature',        type=float,          default=0.5,                help='Sampling temperature for inference (default: 0.5; lower=more predictable, higher=more random)')
+parser.add_argument('--seed',               type=int,            default=None,               help='Random seed for reproducibility (omit for true randomness)')
+parser.add_argument('--dataset',            type=str,            default='male_english_names', help='Which corpus to train on. Choices: male_english_names, finnish_womens_names (default: male_english_names)')
 args = parser.parse_args()
 
 # Only seed if explicitly requested — omitting gives true randomness each run
@@ -29,19 +31,53 @@ if args.seed is not None:
 # Corpus Grabbing and Preparation
 # ================================
 
-def get_corpus_and_persist_locally() -> list[str]:
-    if not os.path.exists('input.txt'):
+# Registry of available datasets.
+# Each entry maps a dataset key (used in --dataset and in model filenames) to:
+#   url     — where to fetch the raw data from GitHub
+#   parse   — a function that takes the raw file text and returns a list of name strings
+#
+# Adding a new dataset means adding one entry here; nothing else in the file needs to change.
+DATASETS: dict = {
+    'male_english_names': {
+        'url':   'https://raw.githubusercontent.com/karpathy/makemore/refs/heads/master/names.txt',
+        # One name per line, plain text — strip whitespace and drop blanks.
+        'parse': lambda text: [line.strip() for line in text.strip().split('\n') if line.strip()],
+    },
+    'finnish_womens_names': {
+        'url':   'https://raw.githubusercontent.com/janipalsamaki/finnish-names/master/data/names-women.csv',
+        # Semicolon-separated CSV: "Name;count" — we only want the name (first field).
+        # The file has no header row, so every non-blank line is a data line.
+        # We also filter out any entry containing a dot — the dataset has one artefact
+        # ("M.") that is an abbreviation, not a real name, and dots would pollute the
+        # vocabulary with a character that never appears in genuine Finnish names.
+        'parse': lambda text: [line.split(';')[0].strip() for line in text.strip().split('\n') if line.strip() and '.' not in line.split(';')[0]],
+    },
+}
+
+def get_corpus_and_persist_locally(dataset_key: str) -> list[str]:
+    if dataset_key not in DATASETS:
+        raise ValueError(f"Unknown dataset '{dataset_key}'. Available: {list(DATASETS.keys())}")
+
+    local_path = os.path.join('data', f'{dataset_key}.txt')
+
+    if not os.path.exists(local_path):
         import urllib.request
-        names_url = 'https://raw.githubusercontent.com/karpathy/makemore/refs/heads/master/names.txt'
-        urllib.request.urlretrieve(names_url, 'input.txt')
-    docs = [l.strip() for l in open('input.txt').read().strip().split('\n') if l.strip()]
+        entry = DATASETS[dataset_key]
+        print(f"Downloading '{dataset_key}' corpus from {entry['url']} ...")
+        urllib.request.urlretrieve(entry['url'], local_path)
+        print(f"Saved to {local_path}")
+
+    raw_text = open(local_path, encoding='utf-8').read()
+    docs = DATASETS[dataset_key]['parse'](raw_text)
     random.shuffle(docs)
     return docs
 
 # Tokenizer
 # =========
 
-docs = get_corpus_and_persist_locally()
+dataset_key = args.dataset
+docs = get_corpus_and_persist_locally(dataset_key)
+print(f"dataset: {dataset_key} ({len(docs)} entries)")
 # Lesson 1: We want unique set of tokens here
 uchars = sorted(set(''.join(docs)))
 # Lesson 2: We want a BOS token to mark the beginning and end of a sequence
@@ -75,7 +111,7 @@ print(f"num params: {len(params)}")
 
 def train(docs: list[str], state_dict: dict, params: list[Value], num_steps: int,
           learning_rate: float, n_embed: int, n_layer: int, n_head: int, head_dim: int,
-          block_size: int, BOS: int, uchars: list[str], saved_filename: str) -> None:
+          block_size: int, BOS: int, uchars: list[str], saved_filename: str, dataset: str) -> None:
 
     log_every_n_steps   = 100
     recent_losses: list[float] = []
@@ -212,10 +248,16 @@ def train(docs: list[str], state_dict: dict, params: list[Value], num_steps: int
                 print(f"step {steps_completed:4d} / {num_steps:4d} | avg loss {rolling_average:.4f}")
 
     except KeyboardInterrupt:
+        # Training can take minutes or hours. The KeyboardInterrupt handler (Ctrl-C)
+        # lets you bail out early without losing all your work — the weights trained so
+        # far are perfectly usable for inference, just less polished than a full run.
+        # The partial model is saved under a filename that records the actual step count
+        # rather than the originally requested num_steps, so it won't be mistaken for a
+        # completed run and won't overwrite one.
         print(f"\nTraining interrupted at step {steps_completed} / {num_steps}.")
         answer = input("Save model with steps completed so far? [y/n] ")
         if answer.strip().lower() == 'y':
-            partial_filename = model_filename(n_embed, n_head, n_layer, block_size, steps_completed, learning_rate)  # uses steps_completed not num_steps to reflect actual progress
+            partial_filename = model_filename(dataset, n_embed, n_head, n_layer, block_size, steps_completed, learning_rate)  # uses steps_completed not num_steps to reflect actual progress
             save_model(state_dict, partial_filename)
         else:
             print("Discarding weights.")
@@ -225,7 +267,7 @@ def train(docs: list[str], state_dict: dict, params: list[Value], num_steps: int
 
 num_steps     = args.num_steps
 retrain       = args.retrain
-saved_filename = model_filename(n_embed, n_head, n_layer, block_size, num_steps, args.learning_rate)
+saved_filename = model_filename(dataset_key, n_embed, n_head, n_layer, block_size, num_steps, args.learning_rate)
 
 if not retrain and os.path.exists(saved_filename):
     load_model(state_dict, saved_filename)
@@ -244,15 +286,17 @@ else:
         BOS=BOS,
         uchars=uchars,
         saved_filename=saved_filename,
+        dataset=dataset_key,
     )
 
 # Inference
 # =========
 
-# in (0, 1] — controls the "creativity" of generated text.
-# Low temperature → model picks the most likely characters more often → names sound more normal but repetitive.
+# in (0, ∞) — controls the "creativity" of generated text.
+# Low temperature  → model picks the most likely characters more often → names sound more normal but repetitive.
 # High temperature → probability is spread more evenly → more creative but potentially nonsensical.
-temperature = 0.5
+# Try --temperature 0.1 for very safe/repetitive names, --temperature 2.0 for chaotic output.
+temperature = args.temperature
 number_of_items_to_generate = args.num_names
 print("\n--- inference (new, hallucinated names) ---")
 for sample_number in range(number_of_items_to_generate):
@@ -277,8 +321,21 @@ for sample_number in range(number_of_items_to_generate):
         #
         # temperature = 0.1  →  [2.0/0.1, 1.5/0.1, 1.0/0.1] = [20.0, 15.0, 10.0]
         # softmax([20.0, 15.0, 10.0]) → [0.99, 0.007, 0.00003]  # almost deterministic
-        # In anti-probable mode, negate the logits before softmax so the model's
-        # least likely characters become the most likely — maximally un-name-like output.
+        # Anti-probable mode vs. high temperature — are they the same thing?
+        # ===
+        # Not quite, though both produce nonsense. The difference is in *how* the
+        # probability mass gets redistributed:
+        #
+        # High temperature (e.g. --temperature 100) divides all logits by a huge number,
+        # squashing them toward zero before softmax. Softmax of near-zero logits is close
+        # to a uniform distribution — every character becomes roughly equally likely.
+        # The result is essentially random noise with no preference for any character.
+        #
+        # Anti-probable mode negates the logits, which *flips the ranking*: the character
+        # the model considers most likely becomes the least likely, and vice versa. It is
+        # not uniform noise — it is the model's considered opinion, reversed. The model
+        # has learned, say, that 'q' almost never follows a vowel in a name; anti-probable
+        # mode makes that the preferred choice. The outputers become the most likely — maximally un-name-like output.
         sign: int = -1 if args.anti_probable_mode else 1
         probs: Vector = softmax([sign * l / temperature for l in logits])
         # Sample the next token weighted by the probability distribution.
