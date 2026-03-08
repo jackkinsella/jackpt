@@ -14,9 +14,10 @@ random.seed(42)
 # Command-line arguments
 # ======================
 parser = argparse.ArgumentParser(description='JackPT — a micro GPT implementation')
-parser.add_argument('--retrain',   action='store_true', default=False, help='Force retraining even if a saved model exists')
-parser.add_argument('--num_steps', type=int,            default=1000,  help='Number of training steps (default: 1000)')
-parser.add_argument('--n_embed',   type=int,            default=16,    help='Embedding dimensionality (default: 16)')
+parser.add_argument('--retrain',            action='store_true', default=False, help='Force retraining even if a saved model exists')
+parser.add_argument('--num_steps',          type=int,            default=1000,  help='Number of training steps (default: 1000)')
+parser.add_argument('--n_embed',            type=int,            default=16,    help='Embedding dimensionality (default: 16)')
+parser.add_argument('--anti-probable-mode', action='store_true', default=False, help='Invert the probability distribution to generate maximally unlikely output')
 args = parser.parse_args()
 
 # Corpus Grabbing and Preparation
@@ -263,7 +264,10 @@ for sample_number in range(number_of_items_to_generate):
         #
         # temperature = 0.1  →  [2.0/0.1, 1.5/0.1, 1.0/0.1] = [20.0, 15.0, 10.0]
         # softmax([20.0, 15.0, 10.0]) → [0.99, 0.007, 0.00003]  # almost deterministic
-        probs: Vector = softmax([l / temperature for l in logits])
+        # In anti-probable mode, negate the logits before softmax so the model's
+        # least likely characters become the most likely — maximally un-name-like output.
+        sign: int = -1 if args.anti_probable_mode else 1
+        probs: Vector = softmax([sign * l / temperature for l in logits])
         # Sample the next token weighted by the probability distribution.
         # range(vocab_size) is the full set of token indices; weights steers the random choice.
         # [0] unwraps the single-item list that random.choices always returns.
