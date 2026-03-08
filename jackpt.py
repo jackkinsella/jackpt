@@ -19,6 +19,7 @@ parser.add_argument('--retrain',            action='store_true', default=False, 
 parser.add_argument('--num_steps',          type=int,            default=1000,  help='Number of training steps (default: 1000)')
 parser.add_argument('--n_embed',            type=int,            default=16,    help='Embedding dimensionality (default: 16)')
 parser.add_argument('--anti-probable-mode', action='store_true', default=False, help='Invert the probability distribution to generate maximally unlikely output')
+parser.add_argument('--num-names',          type=int,            default=20,    help='Number of names to generate during inference (default: 20)')
 parser.add_argument('--learning-rate',      type=float,          default=0.01,  help='Adam optimizer learning rate (default: 0.01, try 0.005 for larger models)')
 args = parser.parse_args()
 
@@ -217,7 +218,7 @@ else:
 # Low temperature → model picks the most likely characters more often → names sound more normal but repetitive.
 # High temperature → probability is spread more evenly → more creative but potentially nonsensical.
 temperature = 0.5
-number_of_items_to_generate = 20
+number_of_items_to_generate = args.num_names
 print("\n--- inference (new, hallucinated names) ---")
 for sample_number in range(number_of_items_to_generate):
     keys: KVCache   = [[] for _ in range(n_layer)]
