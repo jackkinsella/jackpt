@@ -2,10 +2,10 @@ import os
 import json
 
 
-def model_filename(n_embed: int, n_head: int, n_layer: int, block_size: int, num_steps: int) -> str:
+def model_filename(n_embed: int, n_head: int, n_layer: int, block_size: int, num_steps: int, learning_rate: float) -> str:
     # Filename encodes the hyperparameters so different runs don't overwrite each other.
-    # e.g. "models/jackpt_embed16_heads4_layers1_block16_steps1000.json"
-    return f"models/jackpt_embed{n_embed}_heads{n_head}_layers{n_layer}_block{block_size}_steps{num_steps}.json"
+    # e.g. "models/jackpt_embed16_heads4_layers1_block16_steps1000_lr0.005.json"
+    return f"models/jackpt_embed{n_embed}_heads{n_head}_layers{n_layer}_block{block_size}_steps{num_steps}_lr{learning_rate}.json"
 
 
 def save_model(state_dict: dict, filename: str) -> None:

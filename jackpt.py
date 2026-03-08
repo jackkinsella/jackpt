@@ -19,6 +19,7 @@ parser.add_argument('--retrain',            action='store_true', default=False, 
 parser.add_argument('--num_steps',          type=int,            default=1000,  help='Number of training steps (default: 1000)')
 parser.add_argument('--n_embed',            type=int,            default=16,    help='Embedding dimensionality (default: 16)')
 parser.add_argument('--anti-probable-mode', action='store_true', default=False, help='Invert the probability distribution to generate maximally unlikely output')
+parser.add_argument('--learning-rate',      type=float,          default=0.01,  help='Adam optimizer learning rate (default: 0.01, try 0.005 for larger models)')
 args = parser.parse_args()
 
 # Corpus Grabbing and Preparation
@@ -72,7 +73,7 @@ num_steps          = args.num_steps
 retrain            = args.retrain
 log_every_n_steps  = 100  # print a rolling average every 100 steps
 recent_losses: list[float] = []               # accumulates raw loss values for rolling average
-saved_filename = model_filename(n_embed, n_head, n_layer, block_size, num_steps)
+saved_filename = model_filename(n_embed, n_head, n_layer, block_size, num_steps, args.learning_rate)
 
 first_moment  = [0.0] * len(params) # exponential moving average of gradients
 second_moment = [0.0] * len(params) # exponential moving average of squared gradients
@@ -160,7 +161,7 @@ else:
         # Adam keeps a smoothed running average of gradients (first moment) and a
         # running average of squared gradients (second moment), giving each parameter
         # its own personalised, adaptive learning rate.
-        learning_rate       = 0.01  # base learning rate before decay
+        learning_rate       = args.learning_rate  # base learning rate before decay
         first_moment_decay  = 0.85  # how much to weight past gradients (vs new signal) in the running average
         second_moment_decay = 0.99  # same but for squared gradients
         epsilon             = 1e-8  # tiny number added to denominator to prevent division by zero
