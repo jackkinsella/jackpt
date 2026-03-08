@@ -10,8 +10,6 @@ from helpers import Vector, Matrix, softmax
 from model import KVCache, build_model, gpt
 from persistence import model_filename, save_model, load_model
 
-random.seed(42)
-
 # Command-line arguments
 # ======================
 parser = argparse.ArgumentParser(description='JackPT — a micro GPT implementation')
@@ -21,7 +19,12 @@ parser.add_argument('--n_embed',            type=int,            default=16,    
 parser.add_argument('--anti-probable-mode', action='store_true', default=False, help='Invert the probability distribution to generate maximally unlikely output')
 parser.add_argument('--num-names',          type=int,            default=20,    help='Number of names to generate during inference (default: 20)')
 parser.add_argument('--learning-rate',      type=float,          default=0.01,  help='Adam optimizer learning rate (default: 0.01, try 0.005 for larger models)')
+parser.add_argument('--seed',               type=int,            default=None,  help='Random seed for reproducibility (omit for true randomness)')
 args = parser.parse_args()
+
+# Only seed if explicitly requested — omitting gives true randomness each run
+if args.seed is not None:
+    random.seed(args.seed)
 
 # Corpus Grabbing and Preparation
 # ================================
