@@ -1,0 +1,5 @@
+# Trained model weights — regenerate with: python jackpt.py --retrain
+models/
+
+# Downloaded corpus — fetched automatically on first run
+input.txt
