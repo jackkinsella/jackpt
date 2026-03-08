@@ -68,8 +68,10 @@ print(f"num params: {len(params)}")
 # Training Loop
 # =============
 
-num_steps     = args.num_steps
-retrain       = args.retrain
+num_steps          = args.num_steps
+retrain            = args.retrain
+log_every_n_steps  = 100  # print a rolling average every 100 steps
+recent_losses: list[float] = []               # accumulates raw loss values for rolling average
 saved_filename = model_filename(n_embed, n_head, n_layer, block_size, num_steps)
 
 first_moment  = [0.0] * len(params) # exponential moving average of gradients
@@ -199,7 +201,11 @@ else:
             # Zero the gradient so the next step's backward() doesn't accumulate on top of this one.
             param.grad = 0
 
-        print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}")
+        recent_losses.append(loss.data)
+        if (step + 1) % log_every_n_steps == 0:
+            rolling_average = sum(recent_losses) / len(recent_losses)
+            recent_losses.clear()
+            print(f"step {step+1:4d} / {num_steps:4d} | avg loss {rolling_average:.4f}")
 
     save_model(state_dict, saved_filename)
 
